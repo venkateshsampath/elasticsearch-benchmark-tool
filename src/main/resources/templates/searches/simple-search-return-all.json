@@ -1,7 +1,5 @@
 {
   "query": {
-    "query_string": {
-      "query": "_type: benchmark"
-    }
+    "match_all": {}
   }
 }

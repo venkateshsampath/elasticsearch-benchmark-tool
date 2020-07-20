@@ -1,22 +1,16 @@
 package io.logz.benchmarks.elasticsearch.controllers;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
-import io.logz.benchmarks.elasticsearch.configuration.ConfigurationParser;
-import io.logz.benchmarks.elasticsearch.configuration.ElasticsearchConfiguration;
 import io.logz.benchmarks.elasticsearch.configuration.IndexingConfiguration;
 import io.logz.benchmarks.elasticsearch.elasticsearch.ElasticsearchController;
 import io.logz.benchmarks.elasticsearch.exceptions.CouldNotCompleteBulkOperationException;
 import io.logz.benchmarks.elasticsearch.metrics.IndexingMbean;
-import io.searchbox.core.Bulk;
-import io.searchbox.core.Index;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
-import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 /**
@@ -72,30 +66,19 @@ public class IndexingController implements BaseController {
                     return;
                 }
 
-                // Create bulk
-                Bulk currBulk = new Bulk.Builder()
-                        .defaultIndex(esController.getIndexName())
-                        .defaultType(esController.getDefaultType())
-                        .addAction(esController.getMultipleDocuments(configuration.getBulkSize())
-                                .stream()
-                                .map((doc) -> new Index.Builder(doc).build())
-                                .collect(Collectors.toList()))
-                        .build();
-
                 try {
                     // Lets index the bulk!
-                    int numberOfFailedDocuments = esController.executeBulk(currBulk);
+                    int numberOfFailedDocuments = esController.executeBulk(
+                            esController.getMultipleDocuments(configuration.getBulkSize()));
 
                     // Update metrics
                     indexingMbean.incrementSuccessfulDocuments(configuration.getBulkSize() - numberOfFailedDocuments);
                     indexingMbean.incrementFailedDocuements(numberOfFailedDocuments);
 
                 } catch (CouldNotCompleteBulkOperationException e) {
-
                     // Assuming all documents failed..
                     indexingMbean.incrementFailedDocuements(configuration.getBulkSize());
                 }
-
             } catch (Throwable throwable) {
                 logger.debug("Got unexpected exception while indexing!", throwable);
             }

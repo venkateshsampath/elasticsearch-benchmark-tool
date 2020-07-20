@@ -6,7 +6,6 @@ import io.logz.benchmarks.elasticsearch.configuration.SearchConfiguration;
 import io.logz.benchmarks.elasticsearch.elasticsearch.ElasticsearchController;
 import io.logz.benchmarks.elasticsearch.exceptions.CouldNotExecuteSearchException;
 import io.logz.benchmarks.elasticsearch.metrics.SearchMbean;
-import io.searchbox.core.Search;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -73,13 +72,8 @@ public class SearchController implements BaseController {
                 try {
                     String currSearch = esController.getSearch();
 
-                    Search search = new Search.Builder(currSearch)
-                            .addIndex(esController.getSearchIndex())
-                            .addType(esController.getDefaultType())
-                            .build();
-
                     stopwatch.start();
-                    int docCount = esController.executeSearch(search);
+                    int docCount = esController.executeSearch(currSearch);
                     stopwatch.stop();
 
                     searchMbean.incrementSuccessfulSearches();

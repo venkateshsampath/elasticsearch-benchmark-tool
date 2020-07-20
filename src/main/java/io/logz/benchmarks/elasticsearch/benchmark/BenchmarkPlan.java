@@ -73,6 +73,7 @@ public class BenchmarkPlan {
 
     public void cleanupPlan() {
         esController.deleteIndex();
+        esController.stopClient();
     }
 
     public void abortPlan() {

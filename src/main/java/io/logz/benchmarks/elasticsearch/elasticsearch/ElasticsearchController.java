@@ -6,20 +6,29 @@ import io.logz.benchmarks.elasticsearch.configuration.ElasticsearchConfiguration
 import io.logz.benchmarks.elasticsearch.exceptions.CouldNotCompleteBulkOperationException;
 import io.logz.benchmarks.elasticsearch.exceptions.CouldNotExecuteSearchException;
 import io.logz.benchmarks.elasticsearch.exceptions.CouldNotOptimizeException;
-import io.searchbox.client.JestClient;
-import io.searchbox.client.JestClientFactory;
-import io.searchbox.client.JestResult;
-import io.searchbox.client.config.HttpClientConfig;
-import io.searchbox.core.Bulk;
-import io.searchbox.core.BulkResult;
-import io.searchbox.core.Search;
-import io.searchbox.core.SearchResult;
-import io.searchbox.indices.CreateIndex;
-import io.searchbox.indices.DeleteIndex;
-import io.searchbox.indices.ForceMerge;
-import io.searchbox.indices.mapping.PutMapping;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpHost;
+import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
+import org.elasticsearch.action.admin.indices.forcemerge.ForceMergeRequest;
+import org.elasticsearch.action.admin.indices.forcemerge.ForceMergeResponse;
+import org.elasticsearch.action.bulk.BulkItemResponse;
+import org.elasticsearch.action.bulk.BulkRequest;
+import org.elasticsearch.action.bulk.BulkResponse;
+import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.RestClient;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.client.indices.CreateIndexRequest;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.DeprecationHandler;
+import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.search.SearchModule;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.reflections.Reflections;
 import org.reflections.scanners.ResourcesScanner;
 import org.reflections.util.ClasspathHelper;
@@ -34,6 +43,8 @@ import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -52,7 +63,6 @@ public class ElasticsearchController {
     private static final int FIELD_CARDINALITY = 100;
     private static final int MAX_CHARS_IN_FIELD = 10;
     private static final int MIN_CHARS_IN_FIELD = 5;
-    private static final int JEST_READ_TIMEOUT = 2 * 60 * 1000;
     private static final String TEMPLATE_DOCUMENTS_RESOURCE_PATTERN = ".*templates/documents.*";
     private static final String TEMPLATE_SEARCHES_RESOURCE_PATTERN = ".*templates/searches.*";
     private static final String TIMESTAMP_PLACEHOLDER = "TIMESTAMP";
@@ -64,7 +74,7 @@ public class ElasticsearchController {
     private final ArrayList<String> randomFieldsList;
     private final ArrayList<String> rawDocumentsList;
     private final ArrayList<String> searchesList;
-    private final JestClient client;
+    private final RestHighLevelClient client;
     private final String indexName;
     private final Optional<String> indexPrefix;
     private final AtomicInteger lastSelectedDocument;
@@ -83,7 +93,7 @@ public class ElasticsearchController {
 
         logger.info("Random test index name set to: {}", indexName);
 
-        client = initializeJestClient(esConfig);
+        client = initializeRestHighLevelClient(esConfig);
         randomFieldsList = generateRandomFieldList();
         rawDocumentsList = loadDocuments(esConfig.getDocumentsPath(), TEMPLATE_DOCUMENTS_RESOURCE_PATTERN);
         searchesList = loadDocuments(esConfig.getSearchesPath(), TEMPLATE_SEARCHES_RESOURCE_PATTERN);
@@ -102,22 +112,20 @@ public class ElasticsearchController {
     }
 
     public void createIndex() {
-        Settings.Builder settingsBuilder = Settings.settingsBuilder();
-        settingsBuilder.put("number_of_shards", esConfig.getNumberOfShards());
-        settingsBuilder.put("number_of_replicas", esConfig.getNumberOfReplicas());
-
-        // No nice way to build this with elasticsearch library
-        String mappings = "{ \"" + DEFAULT_TYPE + "\" : { \"properties\" : { \"@timestamp\" : {\"type\" : \"date\", \"format\" : \"epoch_millis\"}}}}";
-
+        CreateIndexRequest request = new CreateIndexRequest(indexName);
+        request.settings(Settings.builder()
+                .put("index.number_of_shards", esConfig.getNumberOfShards())
+                .put("index.number_of_replicas", esConfig.getNumberOfReplicas())
+        );
+        String mappings = "{ \"properties\" : { \"@timestamp\" : {\"type\" : \"date\", \"format\" : \"epoch_millis\"}}}";
+        request.mapping(mappings, XContentType.JSON);
         try {
             logger.info("Creating test index on ES, named {} with {} shards and {} replicas", indexName, esConfig.getNumberOfShards(), esConfig.getNumberOfReplicas());
-            client.execute(new CreateIndex.Builder(indexName).settings(settingsBuilder.build().getAsMap()).build());
-            client.execute(new PutMapping.Builder(indexName, DEFAULT_TYPE, mappings).build());
+            client.indices().create(request, RequestOptions.DEFAULT);
 
             indexCreated = true;
-
         } catch (IOException e) {
-            throw new RuntimeException("Could not create index in elasticsearch!", e);
+            throw new RuntimeException("RestHighLevelClient: Could not create index in elasticsearch!", e);
         }
     }
 
@@ -125,9 +133,9 @@ public class ElasticsearchController {
         try {
             if (indexCreated) {
                 logger.info("Deleting test index {} from ES", indexName);
-                client.execute(new DeleteIndex.Builder(indexName).build());
+                DeleteIndexRequest request = new DeleteIndexRequest(indexName);
+                client.indices().delete(request, RequestOptions.DEFAULT);
             }
-
         } catch (IOException e) {
             throw new RuntimeException("Could not delete index from ES!", e);
         }
@@ -157,40 +165,77 @@ public class ElasticsearchController {
     }
 
     // Return the number of failed documents
-    public int executeBulk(Bulk bulk) throws CouldNotCompleteBulkOperationException {
+    public int executeBulk(List<String> documents) throws CouldNotCompleteBulkOperationException {
+        int numberOfFailures = 0;
         try {
-
-            BulkResult result = client.execute(bulk);
-            return result.getFailedItems().size();
+            BulkRequest bulkRequest = new BulkRequest();
+            IntStream.range(0, documents.size()).forEach((index) -> {
+                String doc = documents.get(index);
+                bulkRequest.add(new IndexRequest(indexName).source(doc, XContentType.JSON));
+            });
+            BulkResponse bulkResponse = client.bulk(bulkRequest, RequestOptions.DEFAULT);
+            if(bulkResponse.hasFailures()) {
+                for(BulkItemResponse response: bulkResponse.getItems()) {
+                    if(response.isFailed()) {
+                        numberOfFailures = numberOfFailures + 1;
+                    }
+                }
+            }
 
         } catch (IOException e) {
             throw new CouldNotCompleteBulkOperationException(e);
+        } catch (Exception e) {
+            logger.debug("Got interrupt, stopping indexing thread #{}", Thread.currentThread().getName());
+            logger.trace("Got Interrupted while Bulk Operation!!", e);
         }
+        return numberOfFailures;
     }
 
     // Returns the number of documents found
-    public int executeSearch(Search search) throws CouldNotExecuteSearchException {
-
+    public int executeSearch(String searchJSONQuery) throws CouldNotExecuteSearchException {
+        int docsFound = 0;
         try {
-            SearchResult result = client.execute(search);
+            SearchSourceBuilder sourceBuilder = new SearchSourceBuilder();
+            SearchModule searchModule = new SearchModule(Settings.EMPTY, false, Collections.emptyList());
+            try (XContentParser parser = XContentFactory.xContent(XContentType.JSON).createParser(
+                    new NamedXContentRegistry(searchModule.getNamedXContents()),
+                    DeprecationHandler.IGNORE_DEPRECATIONS, searchJSONQuery)){
+                sourceBuilder.parseXContent(parser);
+            }
+            SearchRequest request = new SearchRequest(indexName);
+            request.source(sourceBuilder);
+            SearchResponse response = client.search(request, RequestOptions.DEFAULT);
 
-            if (result.isSucceeded()) {
-                return result.getTotal();
+            if (isSucceeded(response.status())) {
+                docsFound = response.getHits().getHits().length;
+                return docsFound;
             } else {
-                logger.debug(result.getErrorMessage());
+                logger.debug(response.status().name());
                 throw new CouldNotExecuteSearchException();
             }
         } catch (IOException e) {
             throw new CouldNotExecuteSearchException(e);
+        } catch (Exception e) {
+            logger.debug("Got interrupt, stopping search thread #{}", Thread.currentThread().getName());
+            logger.trace("Got Interrupted while search Operation!!", e);
         }
+        return docsFound;
     }
 
-    public void executeForceMerge(ForceMerge forceMerge) throws CouldNotOptimizeException {
-        try {
-            JestResult result = client.execute(forceMerge);
-            if (!result.isSucceeded())
-                throw new CouldNotOptimizeException(result.getErrorMessage());
+    private boolean isSucceeded(RestStatus status) {
+        return (status.getStatus() / 100) == 2;
+    }
 
+    public void executeForceMerge(int numberOfSegments) throws CouldNotOptimizeException {
+        try {
+            ForceMergeRequest forceMergeRequest = new ForceMergeRequest();
+            forceMergeRequest.maxNumSegments(numberOfSegments);
+            ForceMergeResponse response = client.indices()
+                    .forcemerge(forceMergeRequest, RequestOptions.DEFAULT);
+            RestStatus status = response.getStatus();
+            if(!isSucceeded(status)) {
+                throw new CouldNotOptimizeException(status.toString() + ":" + status.getStatus());
+            }
         } catch (IOException e) {
             throw new CouldNotOptimizeException(e);
         }
@@ -244,21 +289,14 @@ public class ElasticsearchController {
         return getRandomString(length);
     }
 
-    private JestClient initializeJestClient(ElasticsearchConfiguration esConfig) {
-        JestClientFactory factory = new JestClientFactory();
-        HttpClientConfig.Builder httpClientBuilder = new HttpClientConfig
-                .Builder(esConfig.getElasticsearchProtocol() + "://" + esConfig.getElasticsearchAddress() + ":" + esConfig.getElasticsearchPort())
-                .multiThreaded(true)
-                .readTimeout(JEST_READ_TIMEOUT);
-
-        if (StringUtils.isNotEmpty(esConfig.getUserName()) && StringUtils.isNotEmpty(esConfig.getPassword())) {
-            httpClientBuilder.defaultCredentials(esConfig.getUserName(), esConfig.getPassword());
-        }
-
-        factory.setHttpClientConfig(httpClientBuilder.build());
-
-        logger.info("Creating Jest client to handle all ES operations");
-        return factory.getObject();
+    private RestHighLevelClient initializeRestHighLevelClient(ElasticsearchConfiguration esConfig) {
+        return new RestHighLevelClient(
+                RestClient.builder(
+                        new HttpHost(esConfig.getElasticsearchAddress(), esConfig.getElasticsearchPort()))
+                .setRequestConfigCallback(
+                        builder -> builder.setConnectTimeout(5000)
+                                .setSocketTimeout(60000))
+        );
     }
 
     private ArrayList<String> generateRandomFieldList() {
@@ -323,5 +361,14 @@ public class ElasticsearchController {
         }
 
         return tempFilesContentList;
+    }
+
+    public void stopClient() {
+        try {
+            client.close();
+            logger.info("shutdown elasticsearch Rest High Level Client: Done!!");
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to close Rest High Level Client");
+        }
     }
 }
