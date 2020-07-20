@@ -21,7 +21,7 @@ Can be found under ConfigurationExample.conf
                      -e SERVICE_HOST="BENCHMARK_TEST_NAME" \
                      -v /your/configuration.conf:/config.conf \
                      -v /your/templates:/templates \
-                     logzio/elasticsearch-benchmark-tool
+                     venkateshsampath/elasticsearch-benchmark-tool
 ```
 
 ## Build
